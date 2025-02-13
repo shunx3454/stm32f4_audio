@@ -1,0 +1,3 @@
+D:/Code/stm32/arm-gcc/f407_audio/build/CMakeFiles/f407_audio.dir
+D:/Code/stm32/arm-gcc/f407_audio/build/CMakeFiles/edit_cache.dir
+D:/Code/stm32/arm-gcc/f407_audio/build/CMakeFiles/rebuild_cache.dir

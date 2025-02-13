@@ -1,0 +1,21 @@
+
+/* mem */
+#define LINKSCRIP_EXSRAM
+#ifdef LINKSCRIP_EXSRAM
+#define __ATTR_EXSRAM __attribute__((section(".exsram")))
+#endif
+
+/* SDIO Config */
+#define SDIO_RW_TEST    1
+#define SDIO_USE_DMA    1
+#define SDIO_USE_REGISTCALLBAKS 1
+
+
+/* LCD BLK Pin */
+#define LCD_BLK_GPIO_Port GPIOB
+#define LCD_BLK_Pin GPIO_PIN_15
+#define LCD_BLK_GPIO_CLK_ENABLE __HAL_RCC_GPIOB_CLK_ENABLE
+#define LCD_USE_DMA 1
+
+/* Build Time */
+#define BUILD_TIME "@BUILD_TIME@"

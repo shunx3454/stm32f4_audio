@@ -1,0 +1,294 @@
+
+int FillReadBuffer(unsigned char *readBuf, unsigned char *readPtr, int bufSize, int bytesLeft, FIL *infile)
+{
+	int nRead;
+	FRESULT res;
+
+	/* move last, small chunk from end of buffer to start, then fill with new data */
+	memmove(readBuf, readPtr, bytesLeft);
+
+	// nRead = fread(readBuf + bytesLeft, 1, bufSize - bytesLeft, infile);
+	res = f_read(infile, readBuf + bytesLeft, bufSize - bytesLeft, (UINT *)&nRead);
+	if (res)
+	{
+		SYS_ERR("f_read");
+		return 0;
+	}
+
+	/* zero-pad to avoid finding false sync word after last frame (from old data in readBuf) */
+	if (nRead < bufSize - bytesLeft)
+		memset(readBuf + bytesLeft + nRead, 0, bufSize - bytesLeft - nRead);
+
+	return nRead;
+}
+
+void thread_mp3_play(void *param)
+{
+	UINT nbr;
+	FIL *fmp3;
+	FRESULT res;
+	uint8_t mp3End = 0;
+	const uint16_t DataSize = 4096;
+	uint8_t *buf0;
+	uint8_t *buf1;
+
+	/* mem alloc */
+	fmp3 = pvPortMalloc(sizeof(FIL));
+	buf0 = pvPortMalloc(DataSize);
+	buf1 = pvPortMalloc(DataSize);
+
+	/* file */
+	res = f_mount(&fs, "/SD", 1);
+	if (res)
+	{
+		SYS_ERR("f_open");
+		goto MEM_FREE;
+	}
+	res = f_open(fmp3, "/SD/OUTPUT.PCM", FA_READ);
+	if (res)
+	{
+		SYS_ERR("f_open");
+		goto FUNMOUNT;
+	}
+
+	/* data fill */
+	res = f_read(fmp3, buf0, DataSize, &nbr);
+	if (res || nbr != DataSize)
+	{
+		SYS_ERR("f_read");
+		goto FCLOSE;
+	}
+	res = f_read(fmp3, buf1, DataSize, &nbr);
+	if (res || nbr != DataSize)
+	{
+		SYS_ERR("f_read");
+		goto FCLOSE;
+	}
+
+	/* it is best to interrupt */
+	taskENTER_CRITICAL();
+
+	/* config wm8978 */
+	if (WM8978_Init() != 0)
+	{
+		printf("wm8978 error\r\n");
+	}
+	WM8978_ADDA_Cfg(1, 0);
+	WM8978_Input_Cfg(0, 0, 0);
+	WM8978_Output_Cfg(1, 0);
+	WM8978_HPvol_Set(0, 0);
+	WM8978_SPKvol_Set(15);
+	WM8978_I2S_Cfg(2, 0);
+
+	/* i2s config */
+	i2s_init(I2S_DATAFORMAT_16B, I2S_AUDIOFREQ_44K);
+	i2s_dma_init();
+
+	/* start dma-i2s trans buf0 then buf1*/
+	HAL_I2S_Transmit_DMA(&g_i2s2, (uint16_t *)buf0, 1);
+	/* 取消 I2s DMA请求 */
+	HAL_I2S_DMAPause(&g_i2s2); 
+	/* 设置 HAL_DMA STATUS 暂停 状态，并失能 DMA，中断  */
+	HAL_DMA_Abort_IT(g_i2s2.hdmatx);
+	/* 等待中断完成 HAL_DMA STAT = READY，DMA 自动关闭所有 中断 */
+	while (g_i2s2.hdmatx->State != HAL_DMA_STATE_READY){}
+	/* 收到添加中断回调函数 */
+	HAL_DMA_RegisterCallback(g_i2s2.hdmatx, HAL_DMA_XFER_CPLT_CB_ID, I2S_DMA_M0TransferCpltCallback);
+	HAL_DMA_RegisterCallback(g_i2s2.hdmatx, HAL_DMA_XFER_M1CPLT_CB_ID, I2S_DMA_M1TransferCpltCallback);
+
+	HAL_DMAEx_MultiBufferStart_IT(g_i2s2.hdmatx, (uint32_t)buf0, (uint32_t)(&g_i2s2.Instance->DR), (uint32_t)buf1, DataSize / 2);
+	/* 重新开启 I2S DMA请求 */
+	HAL_I2S_DMAResume(&g_i2s2);
+
+	taskEXIT_CRITICAL();
+
+	do
+	{
+		/* fill buf0 */
+		if (i2s_dma_m0transcplt)
+		{
+			i2s_dma_m0transcplt = 0;
+			f_read(fmp3, buf0, DataSize, &nbr);
+			if (DataSize > nbr)
+			{
+				memset(buf0 + nbr, 0, DataSize - nbr);
+				mp3End = 1;
+			}
+		}
+		/* fill buf1 */
+		if (i2s_dma_m1transcplt)
+		{
+			i2s_dma_m1transcplt = 0;
+			f_read(fmp3, buf1, DataSize, &nbr);
+			if (DataSize > nbr)
+			{
+				memset(buf0 + nbr, 0, DataSize - nbr);
+				mp3End = 1;
+			}
+		}
+
+		vTaskDelay(5);
+
+	} while (!mp3End);
+
+	/* Music end */
+	HAL_DMA_Abort_IT(g_i2s2.hdmatx);
+
+FCLOSE:
+	f_close(fmp3);
+FUNMOUNT:
+	f_unmount("/SD");
+MEM_FREE:
+	vPortFree(fmp3);
+	vPortFree(buf0);
+	vPortFree(buf1);
+
+	for (;;)
+	{
+		vTaskDelay(500);
+	}
+}
+
+void I2S_DMA_M1TransferCpltCallback(DMA_HandleTypeDef *hdma)
+{
+	i2s_dma_m1transcplt = 1;
+	// printf("i2s dma m1 tx cplt\n");
+}
+
+void I2S_DMA_M0TransferCpltCallback(DMA_HandleTypeDef *hdma)
+{
+	i2s_dma_m0transcplt = 1;
+	// printf("i2s dma m0 tx cplt\n");
+}
+
+void thread_mp3_decode(void *param)
+{
+	FRESULT res;
+	UINT nbw;
+	size_t bytesLeft;
+	int nRead, err, offset, outOfData, eofReached;
+	FIL *infile, *outfile;
+	MP3FrameInfo mp3FrameInfo;
+	HMP3Decoder hMP3Decoder;
+
+	/* mem alloc */
+	infile = pvPortMalloc(sizeof(FIL));
+	outfile = pvPortMalloc(sizeof(FIL));
+
+	/* file prepare */
+	res = f_mount(&fs, "/SD", 1);
+	if (res)
+	{
+		SYS_ERR("f_mount");
+		goto EXIT_DECODE;
+	}
+	/* open input file */
+	res = f_open(infile, "/SD/MUSIC/01.MP3", FA_READ);
+	if (res)
+	{
+		SYS_ERR("f_open");
+		goto EXIT_DECODE;
+	}
+	/* open output file */
+	res = f_open(outfile, "/SD/OUTPUT.PCM", FA_CREATE_ALWAYS | FA_WRITE);
+	if (res)
+	{
+		SYS_ERR("f_open");
+		goto EXIT_DECODE;
+	}
+
+	if ((hMP3Decoder = MP3InitDecoder()) == 0)
+	{
+		printf("decoder init error\n");
+		goto EXIT_DECODE;
+	}
+
+	bytesLeft = 0;
+	outOfData = 0;
+	eofReached = 0;
+	readPtr = readBuf;
+	nRead = 0;
+	total_frams = 0;
+	do
+	{
+		/* somewhat arbitrary trigger to refill buffer - should always be enough for a full frame */
+		if (bytesLeft < 2 * MAINBUF_SIZE && !eofReached)
+		{
+			nRead = FillReadBuffer(readBuf, readPtr, READBUF_SIZE, bytesLeft, infile);
+			bytesLeft += nRead;
+			readPtr = readBuf;
+			if (nRead == 0)
+				eofReached = 1;
+		}
+
+		/* find start of next MP3 frame - assume EOF if no sync found */
+		offset = MP3FindSyncWord(readPtr, bytesLeft);
+		if (offset < 0)
+		{
+			outOfData = 1;
+			break;
+		}
+		readPtr += offset;
+		bytesLeft -= offset;
+
+		/* decode one MP3 frame - if offset < 0 then bytesLeft was less than a full frame */
+		err = MP3Decode(hMP3Decoder, (const unsigned char **)&readPtr, &bytesLeft, outBuf, 0);
+
+		if (err)
+		{
+			/* error occurred */
+			switch (err)
+			{
+			case ERR_MP3_INDATA_UNDERFLOW:
+				outOfData = 1;
+				break;
+			case ERR_MP3_MAINDATA_UNDERFLOW:
+				/* do nothing - next call to decode will provide more mainData */
+				break;
+			case ERR_MP3_FREE_BITRATE_SYNC:
+			default:
+				outOfData = 1;
+				break;
+			}
+		}
+		else
+		{
+			/* no error */
+			MP3GetLastFrameInfo(hMP3Decoder, &mp3FrameInfo);
+
+			total_frams++;
+			SYS_LOG("MP3", "frams++");
+			// fwrite(outBuf, mp3FrameInfo.bitsPerSample / 8, mp3FrameInfo.outputSamps, outfile);
+			res = f_write(outfile, outBuf, mp3FrameInfo.bitsPerSample / 8 * mp3FrameInfo.outputSamps, &nbw);
+			if (res)
+			{
+				SYS_ERR("f_write");
+			}
+		}
+	} while (!outOfData);
+
+	// print MP3 Info
+	printf(">>>>>>>>>>MP3 info<<<<<<<<<<\n");
+	printf("bitrate      %d\n", mp3FrameInfo.bitrate);
+	printf("bitsPerSample%d\n", mp3FrameInfo.bitsPerSample);
+	printf("layer        %d\n", mp3FrameInfo.layer);
+	printf("nChans       %d\n", mp3FrameInfo.nChans);
+	printf("outputSamps  %d\n", mp3FrameInfo.outputSamps);
+	printf("samprate     %d\n", mp3FrameInfo.samprate);
+	printf("version      %d\n", mp3FrameInfo.version);
+	printf("frames       %d\n", total_frams);
+
+	MP3FreeDecoder(hMP3Decoder);
+EXIT_DECODE:
+	/* mem free */
+	vPortFree(infile);
+	vPortFree(outfile);
+	f_close(infile);
+	f_close(outfile);
+	f_unmount("/SD");
+
+	for (;;)
+	{
+		vTaskDelay(200);
+	}
+}
