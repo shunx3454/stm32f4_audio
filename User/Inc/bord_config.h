@@ -35,6 +35,6 @@
 #define DECODER_INPUT_THRESHOLD (4096U)
 
 /* Build Time */
-#define BUILD_TIME "2025-02-09-0 16:25:37"
+#define BUILD_TIME "2025-02-13-4 17:22:52"
 
 #endif // __BORD_CONFIG_H_
